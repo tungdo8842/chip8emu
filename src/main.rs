@@ -1,11 +1,17 @@
 use std::fs;
+use std::thread;
+use std::time::Duration;
 
 use minifb::{Key, Scale, ScaleMode, Window, WindowOptions};
+use rand::{self, Rng};
 
+const MICROSEC_PER_SEC: u64 = (10 as u64).pow(6);
+const FREQUENCY: u64 = 4000;
 const WIDTH: usize = 64;
 const HEIGHT: usize = 32;
 const MEM_SIZE: usize = 4096;
 const MEM_START: usize = 0x200;
+const STACK_SIZE: usize = 16;
 const MINIFB_WHITE: u32 = 0x00FFFFFF;
 const MINIFB_BLACK: u32 = 0x00000000;
 
@@ -24,11 +30,14 @@ fn read_program_into_memory(ram: &mut [u8; MEM_SIZE]) {
 }
 
 fn main() {
+    let mut rng = rand::rng();
+
     let mut display_buffer: Vec<u32> = vec![0; WIDTH * HEIGHT];
     let mut ram: [u8; MEM_SIZE] = [0; MEM_SIZE];
     let mut program_counter: usize = MEM_START;
     let mut index_register: u16 = 0;
-    // let stack: u16 = 4096;
+    let mut stack: [usize; STACK_SIZE] = [0; STACK_SIZE];
+    let mut stack_ptr: usize = MEM_SIZE - 1;
     let mut var_registers: [u8; 16] = [0; 16];
     // let delay_timer: u8 = 0;
     // let sound_timer: u8 = 0;
@@ -47,7 +56,7 @@ fn main() {
         panic!("{}", e);
     });
 
-    window.set_target_fps(60);
+    // window.set_target_fps(60);
 
     read_program_into_memory(&mut ram);
 
@@ -65,6 +74,10 @@ fn main() {
         let low_first_nibble = cur_instruction_low / 0b00010000;
         let low_second_nibble = (cur_instruction_low & 0b00001111) as u8;
 
+        let nnn =
+            (high_second_nibble as usize) * 0b0000000100000000 + (cur_instruction_low as usize);
+        let x = high_second_nibble as usize;
+        let y = low_first_nibble as usize;
         // dbg!(program_counter, cur_instruction_high, high_second_nibble);
 
         match high_first_nibble {
@@ -77,14 +90,45 @@ fn main() {
                         .unwrap();
                     program_counter += 2;
                 }
+                0xEE => {
+                    program_counter = stack[stack_ptr];
+                    stack_ptr -= 1;
+                }
                 _ => {
                     program_counter += 2;
                 }
             },
             0x1 => {
-                let jmp_pos: usize =
-                    (high_second_nibble as usize) * 0b00010000 + (cur_instruction_low as usize);
+                let jmp_pos: usize = nnn;
                 program_counter = jmp_pos;
+            }
+            0x2 => {
+                stack[stack_ptr] = program_counter;
+                stack_ptr += 1;
+                program_counter = nnn as usize;
+            }
+            0x3 => {
+                if var_registers[high_second_nibble as usize] == cur_instruction_low {
+                    program_counter += 4;
+                } else {
+                    program_counter += 2;
+                }
+            }
+            0x4 => {
+                if var_registers[high_second_nibble as usize] != cur_instruction_low {
+                    program_counter += 4;
+                } else {
+                    program_counter += 2;
+                }
+            }
+            0x5 => {
+                if var_registers[high_second_nibble as usize]
+                    == var_registers[low_first_nibble as usize]
+                {
+                    program_counter += 4;
+                } else {
+                    program_counter += 2;
+                }
             }
             0x6 => {
                 let register_index = high_second_nibble as usize;
@@ -96,11 +140,88 @@ fn main() {
                 var_registers[register_index] += cur_instruction_low;
                 program_counter += 2;
             }
+            0x8 => match low_second_nibble {
+                0x0 => {
+                    var_registers[high_second_nibble as usize] =
+                        var_registers[low_first_nibble as usize];
+                    program_counter += 2;
+                }
+                0x1 => {
+                    var_registers[x] = var_registers[x] | var_registers[y];
+                    program_counter += 2;
+                }
+                0x2 => {
+                    var_registers[x] = var_registers[x] & var_registers[y];
+                    program_counter += 2;
+                }
+                0x3 => {
+                    var_registers[x] = var_registers[x] ^ var_registers[y];
+                    program_counter += 2;
+                }
+                0x4 => {
+                    if var_registers[x] as u16 + var_registers[y] as u16 > 255 {
+                        var_registers[0xF] = 1;
+                    }
+                    var_registers[x] = var_registers[x].wrapping_add(var_registers[y]);
+                    program_counter += 2;
+                }
+                0x5 => {
+                    var_registers[0xF] = 1;
+                    if (var_registers[x] as i16) - (var_registers[y] as i16) < 0 {
+                        var_registers[0xF] = 0;
+                    }
+                    var_registers[x] = var_registers[x].wrapping_sub(var_registers[y]);
+                    program_counter += 2;
+                }
+                0x6 => {
+                    // TODO: configurable X = Y behavior
+                    var_registers[x] = var_registers[y];
+                    var_registers[0xF] = var_registers[x] % 2;
+                    var_registers[x] = var_registers[x] >> 1;
+                    program_counter += 2;
+                }
+                0x7 => {
+                    var_registers[0xF] = 1;
+                    if (var_registers[y] as i16) - (var_registers[x] as i16) < 0 {
+                        var_registers[0xF] = 0;
+                    }
+                    var_registers[x] = var_registers[y].wrapping_sub(var_registers[x]);
+                    program_counter += 2;
+                }
+                0xE => {
+                    // TODO: configurable X = Y behavior
+                    var_registers[x] = var_registers[y];
+                    var_registers[0xF] = var_registers[x] / 0b10000000;
+                    var_registers[x] = var_registers[x] << 1;
+                    program_counter += 2;
+                }
+
+                _ => {
+                    panic!("Invalid instruction");
+                }
+            },
+            0x9 => {
+                if var_registers[high_second_nibble as usize]
+                    != var_registers[low_first_nibble as usize]
+                {
+                    program_counter += 4;
+                } else {
+                    program_counter += 2;
+                }
+            }
             0xA => {
-                index_register =
-                    (high_second_nibble as u16) * 0b0000000100000000 + (cur_instruction_low as u16);
+                index_register = nnn as u16;
                 program_counter += 2;
                 // println!("A: set index register to {:#X}", index_register);
+            }
+            0xB => {
+                program_counter = nnn + var_registers[x] as usize;
+            }
+            0xC => {
+                let nn = cur_instruction_low;
+                let random_number: u8 = rng.random_range(0..=255);
+                var_registers[x] = nn & random_number;
+                program_counter += 2;
             }
             0xD => {
                 var_registers[0xF] = 0;
@@ -151,9 +272,20 @@ fn main() {
 
                 program_counter += 2;
             }
+            0xE => match cur_instruction_low {
+                0x9E => {}
+                0xA1 => {}
+                _ => (),
+            },
             _ => {
                 program_counter += 2;
             }
         }
+
+        window.update();
+        if window.is_key_down(Key::C) {
+            println!("Key C is pressed")
+        };
+        thread::sleep(Duration::from_micros(MICROSEC_PER_SEC / FREQUENCY));
     }
 }
