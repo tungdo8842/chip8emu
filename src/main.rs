@@ -5,18 +5,52 @@ use std::time::Duration;
 use minifb::{Key, Scale, ScaleMode, Window, WindowOptions};
 use rand::{self, Rng};
 
-const MICROSEC_PER_SEC: u64 = (10 as u64).pow(6);
-const FREQUENCY: u64 = 4000;
+const NUM_KEYS: usize = 16;
+const MICROSEC_PER_SEC: u32 = (10 as u32).pow(6);
+const FREQUENCY: u32 = 4000;
+const MICROSEC_PER_CLOCK: u32 = MICROSEC_PER_SEC / FREQUENCY;
+const TIMING_HZ: u32 = 60;
+const MICROSEC_PER_TIMING_TICK: u32 = MICROSEC_PER_SEC / TIMING_HZ;
+
 const WIDTH: usize = 64;
 const HEIGHT: usize = 32;
-const MEM_SIZE: usize = 4096;
-const MEM_START: usize = 0x200;
-const STACK_SIZE: usize = 16;
 const MINIFB_WHITE: u32 = 0x00FFFFFF;
 const MINIFB_BLACK: u32 = 0x00000000;
 
+const MEM_SIZE: usize = 4096;
+const MEM_START: usize = 0x200;
+const STACK_SIZE: usize = 16;
+const FONT_START: usize = 0x50;
+const FONT_SIZE: usize = 5;
+
+fn font_init(ram: &mut [u8; MEM_SIZE]) {
+    let start_pos: usize = FONT_START;
+    let data: [u8; FONT_SIZE * NUM_KEYS] = [
+        0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
+        0x20, 0x60, 0x20, 0x20, 0x70, // 1
+        0xF0, 0x10, 0xF0, 0x80, 0xF0, // 2
+        0xF0, 0x10, 0xF0, 0x10, 0xF0, // 3
+        0x90, 0x90, 0xF0, 0x10, 0x10, // 4
+        0xF0, 0x80, 0xF0, 0x10, 0xF0, // 5
+        0xF0, 0x80, 0xF0, 0x90, 0xF0, // 6
+        0xF0, 0x10, 0x20, 0x40, 0x40, // 7
+        0xF0, 0x90, 0xF0, 0x90, 0xF0, // 8
+        0xF0, 0x90, 0xF0, 0x10, 0xF0, // 9
+        0xF0, 0x90, 0xF0, 0x90, 0x90, // A
+        0xE0, 0x90, 0xE0, 0x90, 0xE0, // B
+        0xF0, 0x80, 0x80, 0x80, 0xF0, // C
+        0xE0, 0x90, 0x90, 0x90, 0xE0, // D
+        0xF0, 0x80, 0xF0, 0x80, 0xF0, // E
+        0xF0, 0x80, 0xF0, 0x80, 0x80, // F
+    ];
+
+    for i in 0..data.len() {
+        ram[start_pos + i] = data[i];
+    }
+}
+
 fn read_program_into_memory(ram: &mut [u8; MEM_SIZE]) {
-    let program_bytes = fs::read("IBM Logo.ch8").expect("Cannot read file");
+    let program_bytes = fs::read("3-corax+.ch8").expect("Cannot read file");
 
     let mut ram_counter = MEM_START;
     for byte in program_bytes {
@@ -29,6 +63,32 @@ fn read_program_into_memory(ram: &mut [u8; MEM_SIZE]) {
     }
 }
 
+fn get_current_keypresses(window: &Window) -> Vec<bool> {
+    let mut keys_vec = vec![false; NUM_KEYS];
+    for key in window.get_keys() {
+        match key {
+            Key::Key1 => keys_vec[0] = true,
+            Key::Key2 => keys_vec[1] = true,
+            Key::Key3 => keys_vec[2] = true,
+            Key::Key4 => keys_vec[3] = true,
+            Key::Q => keys_vec[4] = true,
+            Key::W => keys_vec[5] = true,
+            Key::E => keys_vec[6] = true,
+            Key::R => keys_vec[7] = true,
+            Key::A => keys_vec[8] = true,
+            Key::S => keys_vec[9] = true,
+            Key::D => keys_vec[10] = true,
+            Key::F => keys_vec[11] = true,
+            Key::Z => keys_vec[12] = true,
+            Key::X => keys_vec[13] = true,
+            Key::C => keys_vec[14] = true,
+            Key::V => keys_vec[15] = true,
+            _ => (),
+        }
+    }
+    return keys_vec;
+}
+
 fn main() {
     let mut rng = rand::rng();
 
@@ -37,10 +97,12 @@ fn main() {
     let mut program_counter: usize = MEM_START;
     let mut index_register: u16 = 0;
     let mut stack: [usize; STACK_SIZE] = [0; STACK_SIZE];
-    let mut stack_ptr: usize = MEM_SIZE - 1;
+    let mut stack_ptr: usize = 0;
     let mut var_registers: [u8; 16] = [0; 16];
-    // let delay_timer: u8 = 0;
-    // let sound_timer: u8 = 0;
+
+    let mut timing_usec: u32 = 0;
+    let mut delay_timer: u8 = 0;
+    let mut sound_timer: u8 = 0;
 
     let mut window = Window::new(
         "chip8emu",
@@ -58,13 +120,16 @@ fn main() {
 
     // window.set_target_fps(60);
 
+    font_init(&mut ram);
     read_program_into_memory(&mut ram);
 
     // emulation loop
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        if program_counter >= 4096 {
+        if program_counter >= (MEM_SIZE - MEM_START - 1) {
             break;
         }
+
+        let current_keypresses: Vec<bool> = get_current_keypresses(&window);
 
         let cur_instruction_high = ram[program_counter];
         let cur_instruction_low = ram[program_counter + 1];
@@ -91,7 +156,7 @@ fn main() {
                     program_counter += 2;
                 }
                 0xEE => {
-                    program_counter = stack[stack_ptr];
+                    program_counter = stack[stack_ptr - 1];
                     stack_ptr -= 1;
                 }
                 _ => {
@@ -105,7 +170,7 @@ fn main() {
             0x2 => {
                 stack[stack_ptr] = program_counter;
                 stack_ptr += 1;
-                program_counter = nnn as usize;
+                program_counter = nnn;
             }
             0x3 => {
                 if var_registers[high_second_nibble as usize] == cur_instruction_low {
@@ -131,19 +196,16 @@ fn main() {
                 }
             }
             0x6 => {
-                let register_index = high_second_nibble as usize;
-                var_registers[register_index] = cur_instruction_low;
+                var_registers[x] = cur_instruction_low;
                 program_counter += 2;
             }
             0x7 => {
-                let register_index = high_second_nibble as usize;
-                var_registers[register_index] += cur_instruction_low;
+                var_registers[x] = var_registers[x].wrapping_add(cur_instruction_low);
                 program_counter += 2;
             }
             0x8 => match low_second_nibble {
                 0x0 => {
-                    var_registers[high_second_nibble as usize] =
-                        var_registers[low_first_nibble as usize];
+                    var_registers[x] = var_registers[y];
                     program_counter += 2;
                 }
                 0x1 => {
@@ -226,8 +288,8 @@ fn main() {
             0xD => {
                 var_registers[0xF] = 0;
 
-                let x_pos = var_registers[high_second_nibble as usize] % (WIDTH as u8);
-                let y_pos = var_registers[low_first_nibble as usize] % (HEIGHT as u8);
+                let x_pos = var_registers[x] % (WIDTH as u8);
+                let y_pos = var_registers[y] % (HEIGHT as u8);
 
                 let n = low_second_nibble;
 
@@ -273,8 +335,79 @@ fn main() {
                 program_counter += 2;
             }
             0xE => match cur_instruction_low {
-                0x9E => {}
-                0xA1 => {}
+                0x9E => {
+                    if current_keypresses[x] == true {
+                        program_counter += 4;
+                    } else {
+                        program_counter += 2;
+                    }
+                }
+                0xA1 => {
+                    if current_keypresses[x] == false {
+                        program_counter += 4;
+                    } else {
+                        program_counter += 2;
+                    }
+                }
+                _ => (),
+            },
+            0xF => match cur_instruction_low {
+                0x07 => {
+                    var_registers[x] = delay_timer;
+                    program_counter += 2;
+                }
+                0x0A => {
+                    let keys = get_current_keypresses(&window);
+                    for (index, key) in keys.iter().enumerate() {
+                        // only go to next instruction if a key is pressed
+                        if *key == true {
+                            var_registers[x] = index as u8;
+                            program_counter += 2;
+                            break;
+                        }
+                    }
+                }
+                0x15 => {
+                    delay_timer = var_registers[x];
+                    program_counter += 2;
+                }
+                0x18 => {
+                    sound_timer = var_registers[x];
+                    program_counter += 2;
+                }
+                0x1E => {
+                    index_register += var_registers[x] as u16;
+                    program_counter += 2;
+                    // TODO: Amiga VF behavior
+                }
+                0x29 => {
+                    index_register = FONT_START as u16 + var_registers[x] as u16 * FONT_SIZE as u16;
+                    program_counter += 2;
+                }
+                0x33 => {
+                    let hundreds = var_registers[x] / 100; // u8, only go up to 255
+                    let tens = var_registers[x] % 100 / 10;
+                    let ones = var_registers[x] % 10;
+
+                    ram[index_register as usize] = hundreds;
+                    ram[index_register as usize + 1] = tens;
+                    ram[index_register as usize + 2] = ones;
+
+                    program_counter += 2;
+                }
+                // TODO: custom behivior toggle
+                0x55 => {
+                    for i in 0..=var_registers[x] {
+                        ram[index_register as usize + i as usize] = var_registers[i as usize];
+                    }
+                    program_counter += 2;
+                }
+                0x66 => {
+                    for i in 0..=var_registers[x] {
+                        var_registers[i as usize] = ram[index_register as usize + i as usize];
+                    }
+                    program_counter += 2;
+                }
                 _ => (),
             },
             _ => {
@@ -282,10 +415,17 @@ fn main() {
             }
         }
 
+        // update screen, wait, and update timers
         window.update();
-        if window.is_key_down(Key::C) {
-            println!("Key C is pressed")
-        };
-        thread::sleep(Duration::from_micros(MICROSEC_PER_SEC / FREQUENCY));
+        thread::sleep(Duration::from_micros(MICROSEC_PER_CLOCK as u64));
+        timing_usec = (timing_usec + MICROSEC_PER_CLOCK) % MICROSEC_PER_SEC;
+        if timing_usec % MICROSEC_PER_TIMING_TICK < MICROSEC_PER_CLOCK {
+            if delay_timer > 0 {
+                delay_timer -= 1
+            };
+            if sound_timer > 0 {
+                sound_timer -= 1
+            };
+        }
     }
 }
